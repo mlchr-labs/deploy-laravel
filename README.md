@@ -105,3 +105,8 @@ Follow [docs/human-guide.md](docs/human-guide.md).
   be backward compatible. Rollback only moves the symlink.
 - **Concurrency without cancellation.** Two pushes queue up, a running migration is never
   interrupted.
+
+## Authorship
+
+Written by Fausto in pair with Claude (model Claude Opus 5.5, `claude-opus-5-5`), through
+Claude Code.
