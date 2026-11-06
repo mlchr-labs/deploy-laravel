@@ -105,3 +105,50 @@ jobs:
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
           echo "Release: $release_id ($(du -h release.tar.gz | cut -f1))"
 
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          (umask 077 && printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key)
+          # Host key comes from a secret, never from ssh-keyscan: trusting the
+          # first contact would allow a man in the middle.
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host deploy-target
+            HostName ${DEPLOY_HOST}
+            Port ${DEPLOY_PORT:-22}
+            User ${DEPLOY_USER}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            BatchMode yes
+            ServerAliveInterval 30
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Upload package
+        env:
+          RELEASE_ID: ${{ steps.package.outputs.release_id }}
+        run: scp -q release.tar.gz "deploy-target:${DEPLOY_PATH}/releases/${RELEASE_ID}.tar.gz"
+
+      - name: Run release script
+        env:
+          RELEASE_ID: ${{ steps.package.outputs.release_id }}
+        run: |
+          ssh deploy-target \
+            "DEPLOY_PATH=$(printf '%q' "$DEPLOY_PATH") bash -s -- $(printf '%q' "$RELEASE_ID")" \
+            < deploy/release.sh
+
+      - name: Health check
+        if: vars.HEALTHCHECK_URL != ''
+        env:
+          HEALTHCHECK_URL: ${{ vars.HEALTHCHECK_URL }}
+        run: curl -fsS --retry 5 --retry-delay 3 --retry-all-errors -o /dev/null "$HEALTHCHECK_URL"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
