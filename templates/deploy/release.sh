@@ -109,3 +109,103 @@ umask 0002
 
 artisan() { "$PHP_BIN" artisan "$@"; }
 
+# ---- 1. Extract ------------------------------------------------------------
+log "extracting $RELEASE_ID"
+mkdir -p "$RELEASE_DIR"
+tar -xzf "$ARCHIVE" -C "$RELEASE_DIR"
+rm -f -- "$ARCHIVE"
+
+# ---- 2. Shared links -------------------------------------------------------
+log "linking shared files"
+# Idempotent, creates the tree on the first deploy.
+mkdir -p \
+  "$SHARED_DIR/storage/app/public" \
+  "$SHARED_DIR/storage/framework/cache/data" \
+  "$SHARED_DIR/storage/framework/sessions" \
+  "$SHARED_DIR/storage/framework/views" \
+  "$SHARED_DIR/storage/logs"
+
+ln -sfn "$SHARED_DIR/.env" "$RELEASE_DIR/.env"
+# rm + ln: "ln -s" pointing at an existing directory would create a nested
+# link (storage/storage) instead of replacing it.
+rm -rf -- "$RELEASE_DIR/storage"
+ln -sfn "$SHARED_DIR/storage" "$RELEASE_DIR/storage"
+mkdir -p "$RELEASE_DIR/bootstrap/cache"
+
+# CUSTOMIZE: extra shared paths, always with rm + ln. Example:
+# rm -rf -- "$RELEASE_DIR/public/uploads"
+# ln -sfn "$SHARED_DIR/public/uploads" "$RELEASE_DIR/public/uploads"
+
+cd "$RELEASE_DIR"
+
+# ---- 3. Composer -----------------------------------------------------------
+# Runs with the runtime PHP so platform_check and extensions match FPM.
+log "composer install"
+"$PHP_BIN" "$COMPOSER_BIN" install \
+  --no-dev --optimize-autoloader --no-interaction --prefer-dist --no-progress
+
+# ---- 4. Laravel (inside the new release, .env already linked) --------------
+if [[ "$STORAGE_LINK" == "1" && ! -e public/storage ]]; then
+  log "storage:link"
+  artisan storage:link
+fi
+
+if [[ "$RUN_MIGRATIONS" == "1" ]]; then
+  log "migrate"
+  artisan migrate --force
+fi
+
+log "optimize"
+# Laravel 11+ caches config, events, routes and views. On older versions
+# replace with: config:cache, route:cache, view:cache, event:cache.
+artisan optimize
+
+# ---- 5. Permissions (release only, no sudo) --------------------------------
+log "permissions"
+chown -R "$DEPLOY_USER:$WEB_GROUP" "$RELEASE_DIR"
+chmod -R g+rwX "$RELEASE_DIR/bootstrap/cache"
+# Only touch what the deploy user owns, files created by PHP-FPM belong to
+# another user and chmod on them would fail.
+find "$SHARED_DIR/storage" -user "$DEPLOY_USER" -exec chmod g+rwX {} +
+find "$SHARED_DIR/storage" -type d -user "$DEPLOY_USER" -exec chmod g+s {} +
+
+# ---- 6. Atomic activation --------------------------------------------------
+PREVIOUS="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+log "activating (previous: ${PREVIOUS:-none})"
+ln -sfn "$RELEASE_DIR" "$CURRENT_NEW"
+mv -Tf "$CURRENT_NEW" "$CURRENT_LINK"
+ACTIVATED=1
+
+# ---- 7. Queues -------------------------------------------------------------
+cd "$CURRENT_LINK"
+case "$QUEUE_MODE" in
+  queue)   log "queue:restart";      artisan queue:restart ;;
+  horizon) log "horizon:terminate";  artisan horizon:terminate ;;
+  none)    ;;
+esac
+for program in $SUPERVISOR_PROGRAMS; do
+  log "supervisorctl restart $program:*"
+  supervisorctl restart "$program:*"
+done
+
+# ---- 8. OPcache --------------------------------------------------------------
+# Nothing to do when Nginx passes $realpath_root in SCRIPT_FILENAME and
+# DOCUMENT_ROOT (see templates/nginx/laravel-realpath.conf). Reloading PHP-FPM
+# needs sudo and is out of scope for this script.
+
+# ---- 9. Retention ----------------------------------------------------------
+# Only directories matching the release id format are considered, legacy
+# releases from another deployer are left untouched.
+log "retention: keeping $KEEP_RELEASES releases"
+ACTIVE="$(readlink -f "$CURRENT_LINK")"
+mapfile -t ALL_RELEASES < <(
+  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+    | grep -E '^[0-9]{14}-[0-9a-f]{7}$' | sort -r || true
+)
+for old in "${ALL_RELEASES[@]:$KEEP_RELEASES}"; do
+  [[ "$RELEASES_DIR/$old" == "$ACTIVE" ]] && continue
+  log "removing old release $old"
+  rm -rf -- "${RELEASES_DIR:?}/$old" || log "warning: could not fully remove $old"
+done
+
+log "done, current -> $RELEASE_DIR"
