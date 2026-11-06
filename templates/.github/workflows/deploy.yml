@@ -1,0 +1,107 @@
+# Continuous deploy to a VPS over SSH, atomic releases (releases + symlink).
+#
+# Required in the "production" environment of the repository:
+#   secrets:   DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS
+#   variables: DEPLOY_HOST, DEPLOY_PORT, DEPLOY_USER, DEPLOY_PATH
+# Optional variable: HEALTHCHECK_URL
+#
+# The server side runs deploy/release.sh, streamed over SSH on every deploy.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never cancel a running deploy, it may be in the middle of a migration.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    env:
+      # CUSTOMIZE: same version as PHP-FPM and the workers on the server.
+      PHP_VERSION: "8.3"
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate deploy variables
+        run: |
+          [[ -n "$DEPLOY_HOST" && -n "$DEPLOY_USER" ]] || { echo "DEPLOY_HOST and DEPLOY_USER are required"; exit 1; }
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.:-]+$ ]] || { echo "invalid DEPLOY_HOST"; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "invalid DEPLOY_USER"; exit 1; }
+          [[ "${DEPLOY_PORT:-22}" =~ ^[0-9]+$ ]] || { echo "invalid DEPLOY_PORT"; exit 1; }
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$DEPLOY_PATH" != *..* ]] || { echo "invalid DEPLOY_PATH"; exit 1; }
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          coverage: none
+
+      - name: Lint PHP files
+        run: git ls-files -z '*.php' | xargs -0 -r -n1 -P4 php -l > /dev/null
+
+      # CUSTOMIZE: enable only if the suite is fast and isolated (no network,
+      # no shared database). Keep "composer install" here with dev packages,
+      # the server installs its own vendor without them.
+      # - name: Tests
+      #   run: |
+      #     composer install --no-interaction --prefer-dist --no-progress
+      #     cp .env.example .env
+      #     php artisan key:generate
+      #     php artisan test
+
+      # CUSTOMIZE: remove both front-end steps if the project has no Vite build.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22" # CUSTOMIZE: match the project (.nvmrc, engines)
+
+      - name: Build front-end assets
+        run: |
+          if [[ -f pnpm-lock.yaml ]]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+            pnpm run build
+          elif [[ -f yarn.lock ]]; then
+            corepack enable
+            yarn install --immutable
+            yarn run build
+          else
+            npm ci
+            npm run build
+          fi
+
+      - name: Build release package
+        id: package
+        run: |
+          release_id="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+          # git archive only ships versioned files, generated assets are appended.
+          git archive --format=tar -o release.tar HEAD
+          if [[ -d public/build ]]; then
+            tar -rf release.tar public/build
+          fi
+          gzip -9 release.tar
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "Release: $release_id ($(du -h release.tar.gz | cut -f1))"
+
