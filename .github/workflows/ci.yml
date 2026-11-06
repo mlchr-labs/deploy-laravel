@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: |
+          for f in templates/deploy/*.sh scripts/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: ShellCheck
+        run: shellcheck templates/deploy/*.sh scripts/*.sh
+
+      - name: YAML parse
+        run: ruby -ryaml -e 'ARGV.each { |f| YAML.load_file(f) }' templates/.github/workflows/*.yml .github/workflows/*.yml
+
+      - name: No em dashes in prose
+        run: |
+          if grep -rn $'—' --include='*.md' . ; then
+            echo "Use commas instead of em dashes."
+            exit 1
+          fi
