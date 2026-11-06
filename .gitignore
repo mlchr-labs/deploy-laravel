@@ -1,0 +1,7 @@
+.envrc
+.DS_Store
+PROMPT.md
+*.tar.gz
+deploy_key
+deploy_key.pub
+known_hosts
